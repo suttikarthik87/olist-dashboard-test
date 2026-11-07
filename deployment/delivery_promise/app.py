@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+from streamlit import config as st_config
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -27,10 +28,17 @@ DATA = HERE / "app_data" / "test_orders.parquet"
 OUTLINES = HERE / "app_data" / "brazil_states.geojson"   # built by build_map.py (click_that_hood, MIT)
 MIN_STATE = 50            # fewer delivered orders than this: the state is greyed out on the map
 GAP_MAX = 12              # the colour scale of the gap maps runs from -12 to +12 (percentage points, days)
-VERSION = "v3 (7 Nov 2026)"
+VERSION = "v4 (8 Nov 2026)"
 OURS, OLIST, GREY, INK, NAVY = "#156082", "#B5651D", "#5A6170", "#1F2430", "#0E2841"
 REGIONS = ["North", "Northeast", "Centre-West", "Southeast", "South"]
 RANGE_95 = "95% range 3.27 to 7.84"    # week-block bootstrap, Table D2 of the notebook
+# Lowest and highest values in the 70,851 training orders, for the new-order checks
+TRAIN_RANGE = {"distance_km": (0.0, 3387.26, "distance", "km"), "item_count": (1, 21, "number of items", ""),
+               "order_item_value": (0.85, 13440.0, "value of goods", "R$"), "order_freight_value": (0.0, 1002.29, "freight", "R$"),
+               "total_weight_kg": (0.002, 184.4, "total weight", "kg"), "total_volume_l": (0.288, 1476.0, "total volume", "litres")}
+HOUR_BANDS = [(0, "night"), (6, "morning"), (12, "afternoon"), (18, "evening")]   # as built in the notebook
+THEME = {"theme.base": "light", "theme.primaryColor": OURS, "theme.backgroundColor": "#F5F6F8",
+         "theme.secondaryBackgroundColor": "#E9ECF1", "theme.textColor": "#1F2430"}
 MAP_METRICS = {"Late rate gap": ("late_gap", "percentage points", "ML promise minus Olist's quotes. Blue: ML late less often."),
                "Promise gap": ("promise_gap", "days", "ML promise minus Olist's quotes. Blue: ML shorter."),
                "Late rate": ("late_ml", "%", "Late rate of the ML promise. Darker: late more often."),
@@ -56,6 +64,13 @@ h3 {font-size: 1.2rem !important; padding-top: .4rem !important}
 [data-stale="true"], .stale-element {opacity: 1 !important; transition: none !important}
 [data-testid="stStatusWidget"] {visibility: hidden}
 </style>"""
+
+# The theme file can't sit at the team repository's root (it would restyle the team's other app), so set it here.
+# The theme reaches the browser at the start of a run, hence the one rerun.
+if any(st_config.get_option(key) != value for key, value in THEME.items()):
+    for key, value in THEME.items():
+        st_config.set_option(key, value)
+    st.rerun()
 
 st.set_page_config(page_title="Olist delivery promise", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(STYLE, unsafe_allow_html=True)
@@ -219,8 +234,26 @@ def state_map(stats, field):
     tooltip = {"html": "<b>{name}</b><br/>Orders delivered {orders}<br/>Late: ML {late_ml}%, Olist {late_olist}%<br/>"
                        "Promise: ML {promise_ml}, Olist {promise_olist} days",
                "style": {"backgroundColor": NAVY, "color": "white", "fontSize": "13px"}}
-    return pdk.Deck(layers=[layer], initial_view_state=pdk.ViewState(latitude=-16.5, longitude=-54, zoom=2.8),
+    return pdk.Deck(layers=[layer], initial_view_state=pdk.ViewState(latitude=-15.8, longitude=-52.5, zoom=2.95),
                     map_provider="carto", map_style=pdk.map_styles.CARTO_LIGHT, tooltip=tooltip)
+
+
+def map_legend(field):
+    """The colour scale of the chosen map measure, with the grey used for too few orders."""
+    if field in ("late_gap", "promise_gap"):
+        unit = "percentage points" if field == "late_gap" else "days"
+        ramp, left, middle, right = ("#156082, #ECECEC, #B5651D", f"−{GAP_MAX} or less: ML better", "0", f"+{GAP_MAX} or more: Olist better")
+    elif field == "late_ml":
+        unit, ramp, left, middle, right = "% late", "#E8F0F5, #156082", "0%", "4%", "8% or more"
+    else:
+        unit, ramp, left, middle, right = "delivered orders", "#E8F0F5, #156082", "10", "100", "10,000 or more"
+    st.markdown(
+        f'<div style="font-size:.8rem;color:#5A6170">'
+        f'<div style="height:12px;border-radius:6px;background:linear-gradient(to right, {ramp})"></div>'
+        f'<div style="display:flex;justify-content:space-between"><span>{left}</span><span>{middle}</span><span>{right}</span></div>'
+        f'<div style="margin-top:4px"><span style="display:inline-block;width:12px;height:12px;border-radius:3px;'
+        f'background:#D0D3DA;vertical-align:middle"></span> Fewer than {MIN_STATE} delivered orders · scale in {unit}</div></div>',
+        unsafe_allow_html=True)
 
 
 def top_states(stats, field):
@@ -232,7 +265,7 @@ def top_states(stats, field):
     bars = alt.Chart(data).mark_bar(color=OURS, size=16).encode(
         y=alt.Y("State:N", title=None, sort="-x"), x=alt.X("Value:Q", title=None, axis=None),
         tooltip=["State:N", alt.Tooltip("Value:Q", format=number)])
-    return (bars + bars.mark_text(align="left", dx=4, color=INK).encode(text=alt.Text("Value:Q", format=number))).properties(height=260)
+    return (bars + bars.mark_text(align="left", dx=4, color=GREY).encode(text=alt.Text("Value:Q", format=number))).properties(height=260)
 
 
 def reliability_chart(table):
@@ -266,6 +299,34 @@ def weekly_table(weeks):
     })
 
 
+def build_steps(parts):
+    """How a promise is built, step by step, from score()'s parts."""
+    tiles([("Log OLS estimate", f"{parts.ols:.1f} days", "linear regression on log days", ""),
+           ("Forest estimate", f"{parts.forest:.1f} days", "random forest", ""),
+           ("Average, on the log scale", f"{parts.estimate:.1f} days", "the typical delivery time", ""),
+           (f"Raised by × {CURRENT:.3f}, rounded up", f"{parts.promise:.0f} days", "the promise", "")])
+    st.caption(f"(1 + {parts.estimate:.1f}) × {CURRENT:.3f} − 1 = {(1 + parts.estimate) * CURRENT - 1:.1f}, rounded up to "
+               f"{parts.promise:.0f}. A promise is late when the parcel arrives after the promised day.")
+
+
+def order_label(row):
+    return f"{row.order_id[:10]}…  ·  bought {row.purchased:%d %b %Y}  ·  {row.customer_state} ← {row.seller_state}"
+
+
+def pick_random():
+    pool = filtered_orders(ss.get("past_state", "All"), ss.get("past_month", "All"))
+    ss.past_order = pool.order_id.sample(1).iloc[0]
+
+
+def filtered_orders(state, month):
+    pool = orders
+    if state != "All":
+        pool = pool[pool.customer_state == state]
+    if month != "All":
+        pool = pool[pool.purchased.dt.strftime("%Y-%m") == month]
+    return pool
+
+
 def tiles(items):
     """The headline strip, one column per item; each item is (label, value, note, tone)."""
     cards = "".join(f'<div class="tile {tone}"><div class="label">{label}</div><div class="value">{value}</div>'
@@ -286,7 +347,9 @@ with st.sidebar:
         "1. **Operations command centre:** how promises are performing, and when the margin needs a "
         "review. Press Play, or jump to a date. Start with late deliveries against Olist, read the "
         "suggested margin, review it after 4 weeks in a row, and retrain only if error passes 6.21 days.\n"
-        "2. **Test results:** the tested numbers, at Olist's quotes as issued and at equal reliability.")
+        "2. **Test results:** the tested numbers, at Olist's quotes as issued and at equal reliability.\n"
+        "3. **Score a past order:** pick any test order and see how its promise was built.\n"
+        "4. **Try a new order:** start from a past order, change its details, and get a new promise.")
     st.header("About the model")
     st.markdown(
         "Equal-weight average of log-linear regression (Log OLS) and a random forest, plus a × 1.893 safety "
@@ -305,7 +368,7 @@ if not check_ok:
              "Check the library versions in deployment/requirements.txt.")
     st.stop()
 
-tab_live, tab_test = st.tabs(["Operations command centre", "Test results"])
+tab_live, tab_test, tab_past, tab_new = st.tabs(["Operations command centre", "Test results", "Score a past order", "Try a new order"])
 
 # ----------------------------------------------------------------------------------------------
 # Tab 1: Operations command centre
@@ -440,7 +503,8 @@ def command_centre():
         field, unit, reading = MAP_METRICS[chosen]
         stats = state_stats(by_delivery.iloc[: by_delivery.delivered.searchsorted(T.normalize())])   # one update a day
         st.pydeck_chart(state_map(stats, field), height=430, width="stretch")
-        st.caption(f"{reading} Grey: fewer than {MIN_STATE} delivered orders. Hover for a state's numbers.")
+        map_legend(field)
+        st.caption(f"{reading} Hover for a state's numbers.")
     with right:
         top = st.columns(2)
         bottom = st.columns(2)
@@ -463,7 +527,7 @@ def command_centre():
             st.markdown("**Promises, estimate and actual delivery (median days)**")
             st.altair_chart(lines(days_daily, T.normalize(), "Days", DAYS_MAX, x_range,
                                   series=("Olist's quotes", "ML promise", "ML estimate", "Actual"),
-                                  colours=(OLIST, OURS, OURS, INK), dashed=("ML estimate",)), width="stretch")
+                                  colours=(OLIST, OURS, OURS, GREY), dashed=("ML estimate",)), width="stretch")
 
     table_side, states_side = st.columns([7, 5])
     with table_side:
@@ -522,6 +586,113 @@ def command_centre():
 with tab_live:
     ss.refreshing = ss.playing
     st.fragment(command_centre, run_every=0.7 if ss.playing else None)()
+
+with tab_past:
+    st.subheader("Score a past order")
+    st.caption("Any of the 25,352 test orders, scored now by the deployed model, with Olist's quote and the actual delivery beside it.")
+    f = st.columns([2, 2, 1.3], vertical_alignment="bottom")
+    state = f[0].selectbox("Customer state", ["All"] + sorted(orders.customer_state.unique()), key="past_state")
+    month = f[1].selectbox("Purchase month", ["All", "2018-05", "2018-06", "2018-07", "2018-08"], key="past_month")
+    f[2].button("Pick a random order", on_click=pick_random, width="stretch")
+    pool = filtered_orders(state, month)
+    shown = pool.head(500)
+    if ss.get("past_order") in set(pool.order_id) and ss.past_order not in set(shown.order_id):
+        shown = pd.concat([pool[pool.order_id == ss.past_order], shown])
+    if ss.get("past_order") not in set(shown.order_id):
+        ss.past_order = shown.order_id.iloc[0]
+    labels = {row.order_id: order_label(row) for row in shown.itertuples()}
+    chosen_id = st.selectbox(f"Order ({len(pool):,} match; the first 500 are listed, or pick at random)", list(labels),
+                             format_func=labels.get, key="past_order")
+    order = orders[orders.order_id == chosen_id].iloc[0]
+    with st.container(border=True):
+        st.markdown("**The order, as known at checkout**")
+        known = st.columns(3)
+        known[0].markdown(f"**Bought** {order.purchased:%a %d %b %Y, %H:%M}  \n**Customer** {order.customer_state}, "
+                          f"{str(order.customer_city).title()}  \n**Seller** {order.seller_state}, {str(order.seller_city).title()}")
+        known[1].markdown(f"**Distance** {order.distance_km:,.0f} km, {'same state' if order.same_state else 'crosses a state border'}  \n"
+                          f"**Items** {order.item_count:.0f} from {order.seller_count:.0f} seller(s), {order.main_category}  \n"
+                          f"**Goods / freight** R\\$ {order.order_item_value:,.2f} / R\\$ {order.order_freight_value:,.2f}")
+        known[2].markdown(f"**Weight / volume** {order.total_weight_kg:,.2f} kg / {order.total_volume_l:,.2f} litres  \n"
+                          f"**Seller's record** {order.seller_prior_orders:,.0f} orders, median handling "
+                          f"{order.seller_prior_handling_days:.1f} days  \n**Peak season** {'Yes' if order.peak_season else 'No'}")
+    ml_due = order.purchased.normalize() + pd.Timedelta(days=int(order.promise))
+    tiles([("ML promise", f"{order.promise:.0f} days", f"Deliver by {ml_due:%a %d %b %Y}", ""),
+           ("Olist's quote", f"{order.olist_days:.0f} days", f"Deliver by {order.olist_due:%a %d %b %Y}", ""),
+           ("What happened", f"{order.delivery_days:.0f} days", f"Delivered {order.delivered:%a %d %b}: ML "
+            f"{'late' if order.late_ours else 'on time'}, Olist {'late' if order.late_olist else 'on time'}",
+            "bad" if order.late_ours else "good")])
+    st.markdown("**How this promise was built**")
+    build_steps(order)
+
+with tab_new:
+    st.subheader("Try a new order")
+    base = orders[orders.order_id == ss.get("past_order", orders.order_id.iloc[0])].iloc[0]
+    st.caption(f"Starts from the order chosen in 'Score a past order' ({base.order_id[:10]}…). Change its details and the deployed "
+               "model gives a new promise. The seller and its record stay as in that order.")
+    if ss.get("try_base") != base.order_id:     # a new starting order: reset the inputs to it
+        ss.try_base = base.order_id
+        ss.update({"try_state": base.customer_state, "try_distance": float(round(base.distance_km, 1)),
+                   "try_date": base.purchased.date(), "try_time": base.purchased.time().replace(second=0, microsecond=0),
+                   "try_items": int(base.item_count), "try_value": float(base.order_item_value),
+                   "try_freight": float(base.order_freight_value), "try_category": base.main_category,
+                   "try_weight": None if pd.isna(base.total_weight_kg) else float(base.total_weight_kg),
+                   "try_volume": None if pd.isna(base.total_volume_l) else float(base.total_volume_l)})
+    with st.container(border=True):
+        where = st.columns(4)
+        new_state = where[0].selectbox("Customer state", sorted(orders.customer_state.unique()), key="try_state")
+        distance = where[1].number_input("Distance to the seller (km)", min_value=0.0, max_value=6000.0, step=10.0, key="try_distance")
+        bought_on = where[2].date_input("Purchase date", key="try_date")
+        bought_at = where[3].time_input("Purchase time", key="try_time")
+        what = st.columns(4)
+        items = what[0].number_input("Number of items", min_value=1, max_value=100, step=1, key="try_items")
+        value = what[1].number_input("Value of goods (R$)", min_value=0.0, step=10.0, key="try_value")
+        freight = what[2].number_input("Freight (R$)", min_value=0.0, step=1.0, key="try_freight")
+        category = what[3].selectbox("Main product category", sorted(orders.main_category.dropna().unique()), key="try_category")
+        size = st.columns(4)
+        weight = size[0].number_input("Total weight (kg), blank if unknown", min_value=0.0, step=0.1, value=None, key="try_weight")
+        volume = size[1].number_input("Total volume (litres), blank if unknown", min_value=0.0, step=0.5, value=None, key="try_volume")
+    new = {"customer_state": new_state, "distance_km": distance, "item_count": items, "order_item_value": value,
+           "order_freight_value": freight, "main_category": category,
+           "total_weight_kg": np.nan if weight is None else weight, "total_volume_l": np.nan if volume is None else volume}
+    stops = []
+    if value <= 0:
+        stops.append("The value of goods must be above zero.")
+    if items < base.seller_count:
+        stops.append(f"This order has {base.seller_count:.0f} sellers, so it needs at least {base.seller_count:.0f} items.")
+    for message in stops:
+        st.error(message, icon="🚫")
+    if not stops:
+        for field, (low, high, name, unit) in TRAIN_RANGE.items():
+            amount, unit = new[field], unit.replace("$", "\\$")
+            if not pd.isna(amount) and not low <= amount <= high:
+                st.warning(f"The {name}, {amount:,} {unit}, is outside the training orders ({low:,} to {high:,} {unit}). "
+                           "The promise may be less reliable.", icon="⚠️")
+        if weight is None or volume is None:
+            st.info("A missing weight or volume is filled with the training median, as in the notebook.")
+        if new_state != base.customer_state and distance == round(base.distance_km, 1):
+            st.info("The customer state changed but the distance didn't. Set the distance to the new customer too.")
+        purchase = pd.Timestamp.combine(bought_on, bought_at)
+        if purchase.month in (11, 12):
+            st.info("Peak-season order: the training months hold only one peak season, so this effect is less certain.")
+        row = base.copy()
+        row.update(pd.Series(new))
+        row["same_state"] = new_state == base.seller_state
+        row["purchase_weekday"] = purchase.day_name()
+        row["purchase_hour_band"] = [band for start, band in HOUR_BANDS if purchase.hour >= start][-1]
+        row["peak_season"] = purchase.month in (11, 12)
+        frame = pd.DataFrame([row[model.features]])
+        for column in ("same_state", "peak_season", "seller_has_history"):
+            frame[column] = frame[column].astype(bool)
+        numeric = [c for c in model.features if c not in ("same_state", "peak_season", "seller_has_history", "customer_state",
+                                                       "seller_state", "main_category", "purchase_weekday", "purchase_hour_band")]
+        frame[numeric] = frame[numeric].astype(float)
+        parts = score(model, frame).iloc[0]
+        due = purchase.normalize() + pd.Timedelta(days=int(parts.promise))
+        tiles([("ML promise", f"{parts.promise:.0f} days", f"Deliver by {due:%a %d %b %Y}", ""),
+               ("Typical delivery time", f"{parts.estimate:.1f} days", "the estimate before the margin", ""),
+               ("Starting order's promise", f"{base.promise:.0f} days", f"{parts.promise - base.promise:+.0f} days with your changes", "")])
+        st.markdown("**How this promise was built**")
+        build_steps(parts)
 
 with tab_test:
     st.subheader("Ensemble model for the delivery promise: results")

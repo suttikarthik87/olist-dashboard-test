@@ -1,0 +1,12 @@
+# The C1 app (deployment/app.py). Pinned to the versions the model was saved and tested with
+# (models/c1_delivery_promise.json); the app's start-up check stops it if any promise changes.
+# Streamlit Community Cloud: choose Python 3.14 under Advanced settings.
+streamlit==1.66.1
+altair==6.3.0
+pydeck==0.9.3
+pyarrow==26.0.0
+pandas==3.0.5
+numpy==2.5.3
+scipy==1.17.1
+scikit-learn==1.8.0
+joblib==1.6.0

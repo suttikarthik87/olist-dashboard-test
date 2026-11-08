@@ -335,7 +335,8 @@ def reliability_chart(table):
         color=alt.Color("Series:N", scale=alt.Scale(domain=series, range=[OURS, "#8FB4C9"]), legend=alt.Legend(orient="top", title=None)),
         tooltip=["Rate:N", "Series:N", alt.Tooltip("Days:Q", format=".2f")])
     labels = base.mark_text(align="left", dx=4, fontWeight="bold").encode(text=alt.Text("Days:Q", format=".2f"))
-    return (bars + labels).properties(width=760, height=300)
+    # A fixed width (a chart in a hidden tab can't measure its column), small enough for a laptop with the sidebar open
+    return (bars + labels).properties(width=560, height=300)
 
 
 def weekly_table(weeks):

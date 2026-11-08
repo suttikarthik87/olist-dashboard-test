@@ -20,5 +20,5 @@ Main file path `deployment/delivery_promise/app.py`; choose Python 3.14 under Ad
 ## Files
 
 `app.py` the dashboard; `predict.py` scoring; `monitor.py` the health checks; `c1_model.py` the class the saved model needs;
-`c1_delivery_promise.pkl` the saved ensemble; `app_data/` the test orders and state outlines (Code for America's click_that_hood,
-MIT licence, simplified).
+`c1_delivery_promise.pkl` the saved ensemble; `app_data/` the test orders, the typical distance between each seller state and customer state (from the
+training orders, used by "Try a new order") and the state outlines (Code for America's click_that_hood, MIT licence, simplified).

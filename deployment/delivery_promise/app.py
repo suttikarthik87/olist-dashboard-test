@@ -26,9 +26,11 @@ from predict import load_model, score  # noqa: E402
 
 DATA = HERE / "app_data" / "test_orders.parquet"
 OUTLINES = HERE / "app_data" / "brazil_states.geojson"   # built by build_map.py (click_that_hood, MIT)
+# Typical distance for each seller state and customer state, from the training orders (tools/build_pair_distance.py)
+PAIR_KM = pd.read_csv(HERE / "app_data" / "state_pair_km.csv").set_index(["seller_state", "customer_state"])
 MIN_STATE = 50            # fewer delivered orders than this: the state is greyed out on the map
 GAP_MAX = 12              # the colour scale of the gap maps runs from -12 to +12 (percentage points, days)
-VERSION = "v6 (8 Nov 2026)"
+VERSION = "v8 (8 Nov 2026)"
 OURS, OLIST, GREY, INK, NAVY = "#156082", "#B5651D", "#5A6170", "#1F2430", "#0E2841"
 REGIONS = ["North", "Northeast", "Centre-West", "Southeast", "South"]
 RANGE_95 = "95% range 3.27 to 7.84"    # week-block bootstrap, Table D2 of the notebook
@@ -46,6 +48,8 @@ MAP_METRICS = {"Late rate gap": ("late_gap", "percentage points", "ML promise mi
 TOP_TITLES = {"Late rate gap": "Top states: fewer late than Olist (points)", "Promise gap": "Top states: longer than Olist (days)",
               "Late rate": "Top states: ML late rate (%)", "Orders": "Top states: delivered orders"}
 STYLE = """<style>
+/* the page as at 80% browser zoom, for every viewer: scale the content, not the scrolling frame around it */
+.block-container, [data-testid="stSidebarUserContent"] {zoom: 0.8}
 .block-container {padding-top: 3.2rem; padding-bottom: 2rem; max-width: none}
 .app-bar {background: #0E2841; color: #fff; border-radius: 10px; padding: 12px 20px; display: flex;
           justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap}
@@ -74,6 +78,15 @@ h3 {font-size: 1.2rem !important; padding-top: .4rem !important}
 .st-key-actions [data-testid="stElementContainer"],
 .st-key-actions [data-testid="stAlert"],
 .st-key-actions [data-testid="stAlertContainer"] {height: 100%}
+/* fixed heights while the clock runs, so the page never jumps: the cards always hold two lines, the status tiles
+   keep their value on one line (the font shrinks to fit a narrow tile) and always hold a two-line note */
+.st-key-actions {container-type: inline-size}
+.st-key-actions [data-testid="stAlertContainer"] {min-height: 82px}
+@container (max-width: 1350px) {.st-key-actions [data-testid="stAlertContainer"] {min-height: 106px}}
+.status-tiles .tile {container-type: inline-size}
+.status-tiles .tile .value {white-space: nowrap; font-size: min(1.55rem, 16cqi)}
+.status-tiles .tile:first-child .value {font-size: min(1.55rem, 12.5cqi)}   /* "Review margin" is the longest value */
+.status-tiles .tile .sub {line-height: 1.5; min-height: 3em}
 </style>"""
 
 # The theme file can't sit at the team repository's root (it would restyle the team's other app), so set it here.
@@ -326,8 +339,9 @@ def top_states(stats, field):
 def reliability_chart(table):
     """Average promise at each late rate, ML promise against Olist's quotes scaled to that rate."""
     data = (table.assign(Rate=[f"At {100 * r:.2f}% late" for r in table.rate]).drop(columns="rate")
+            .rename(columns={"Olist, scaled": "Olist's quotes, scaled"})
             .melt("Rate", var_name="Series", value_name="Days"))
-    series = ["ML promise", "Olist, scaled"]
+    series = ["ML promise", "Olist's quotes, scaled"]
     base = alt.Chart(data).encode(
         y=alt.Y("Rate:N", title=None, sort=None), yOffset=alt.YOffset("Series:N", sort=series),
         x=alt.X("Days:Q", title="Average promise (days)", scale=alt.Scale(domain=[0, 34])))
@@ -335,8 +349,7 @@ def reliability_chart(table):
         color=alt.Color("Series:N", scale=alt.Scale(domain=series, range=[OURS, "#8FB4C9"]), legend=alt.Legend(orient="top", title=None)),
         tooltip=["Rate:N", "Series:N", alt.Tooltip("Days:Q", format=".2f")])
     labels = base.mark_text(align="left", dx=4, fontWeight="bold").encode(text=alt.Text("Days:Q", format=".2f"))
-    # A fixed width (a chart in a hidden tab can't measure its column), small enough for a laptop with the sidebar open
-    return (bars + labels).properties(width=560, height=300)
+    return (bars + labels).properties(height=300)
 
 
 def weekly_table(weeks):
@@ -359,7 +372,7 @@ def build_steps(parts):
     """How a promise is built, step by step, from score()'s parts."""
     tiles([("Log OLS estimate", f"{parts.ols:.1f} days", "linear regression on log days", ""),
            ("Forest estimate", f"{parts.forest:.1f} days", "random forest", ""),
-           ("Average, on the log scale", f"{parts.estimate:.1f} days", "the typical delivery time", ""),
+           ("Ensemble estimate", f"{parts.estimate:.1f} days", "the ML estimate, before the margin", ""),
            (f"Raised by × {CURRENT:.3f}, rounded up", f"{parts.promise:.0f} days", "the promise", "")])
     st.caption(f"(1 + {parts.estimate:.1f}) × {CURRENT:.3f} − 1 = {(1 + parts.estimate) * CURRENT - 1:.1f}, rounded up to "
                f"{parts.promise:.0f}. A promise is late when the parcel arrives after the promised day.")
@@ -374,6 +387,13 @@ def pick_random():
     ss.past_order = pool.order_id.sample(1).iloc[0]
 
 
+def fill_distance(seller_state, own_state, own_km):
+    """When the customer state changes, fill in the typical distance from the seller's state (still editable);
+    back at the starting order's state, its own distance."""
+    state = ss.try_state
+    ss.try_distance = own_km if state == own_state else float(PAIR_KM.loc[(seller_state, state), "km"])
+
+
 def filtered_orders(state, month):
     pool = orders
     if state != "All":
@@ -383,12 +403,12 @@ def filtered_orders(state, month):
     return pool
 
 
-def tiles(items):
-    """The headline strip, one column per item; each item is (label, value, note, tone)."""
+def tiles(items, kind=""):
+    """The headline strip, one column per item; each item is (label, value, note, tone). kind: an extra CSS class."""
     cards = "".join(f'<div class="tile {tone}"><div class="label">{label}</div><div class="value">{value}</div>'
                     f'<div class="sub">{note}</div></div>' for label, value, note, tone in items)
     columns = f"grid-template-columns: repeat({len(items)}, minmax(0, 1fr))"
-    st.markdown(f'<div class="tiles" style="{columns}">{cards}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="tiles {kind}" style="{columns}">{cards}</div>', unsafe_allow_html=True)
 
 
 orders = get_orders()
@@ -527,12 +547,10 @@ def command_centre():
     controls[2].button("Jump to end", on_click=jump_to_end, width="stretch")
     controls[3].select_slider("Speed (days per second)", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], value=1.0, key="speed")
     controls[4].date_input("Jump to a date", value=None, min_value=START.date(), max_value=END.date(), key="jump", on_change=jump_to_date)
-    controls[5].progress(max(0.0, (T - CLOCK_START) / (END - CLOCK_START)), text=f"**{T:%a %d %b %Y, %H:%M}**")
-
     placed = orders.iloc[: orders.purchased.searchsorted(T, side="right")]
     delivered = by_delivery.iloc[: by_delivery.delivered.searchsorted(T, side="right")]
-    if placed.empty:
-        st.info("No orders yet. Press Play to start the test months, or jump to a date.")
+    hint = " · no orders yet: press Play or jump to a date" if placed.empty else ""   # in the clock line, so nothing moves
+    controls[5].progress(max(0.0, (T - CLOCK_START) / (END - CLOCK_START)), text=f"**{T:%a %d %b %Y, %H:%M}**{hint}")
 
     week = monitor.late_now(by_delivery, T)
     check = monitor.margin_check(orders, T, model.log_margin)
@@ -551,7 +569,7 @@ def command_centre():
            ("Estimate error", f"{delivered.error.abs().mean():.2f} days" if len(delivered) else "–",
             f"Retrain above {monitor.RETRAIN_MAE:.2f}", ""),
            ("Margin in use", f"× {CURRENT:.3f}", margin_note, ""),
-           ("Delivered", f"{len(delivered):,}", f"{len(placed) - len(delivered):,} in flight", "")])
+           ("Delivered", f"{len(delivered):,}", f"{len(placed) - len(delivered):,} in flight", "")], kind="status-tiles")
     action_cards(week, check, streak)
 
     x_range = [START, END.normalize()]
@@ -585,12 +603,9 @@ def command_centre():
     table_side, states_side = st.columns([7, 5])
     with table_side:
         st.subheader("Weekly model health")
-        table = weekly_table(weeks)
-        if len(table):
-            st.dataframe(table, hide_index=True, width="stretch", height=min(35 * (len(table) + 1) + 3, 388))
-        else:
-            st.caption("The first weekly check comes once orders bought 32 days ago have arrived.")
-        st.caption("Each week the app suggests a margin; the margin stays fixed until 4 weeks in a row point the same way. "
+        # A fixed height from the start (10 rows, then it scrolls), so the page below never moves
+        st.dataframe(weekly_table(weeks), hide_index=True, width="stretch", height=388)
+        st.caption("The first weekly check comes once orders bought 32 days ago have arrived, about 7 June. Each week the app suggests a margin; the margin stays fixed until 4 weeks in a row point the same way. "
                    "These checks were added after the test, so the tested results stand. Checks run about a month past "
                    "the last purchase, because each one reads orders bought 32 to 60 days earlier; from October they cover "
                    "fewer orders.")
@@ -618,16 +633,16 @@ def command_centre():
             "Actual (days)": np.where(is_done, feed.delivery_days.astype(int).astype(str), "–"),
             "ML": result(feed.late_ours),
             "Olist": result(feed.late_olist),
-        }), hide_index=True, width="stretch")
+        }), hide_index=True, width="stretch", height=35 * 9 + 3)     # room for all 8 rows from the start
     with region_side:
         st.subheader("By customer region")
         regions = (delivered.groupby("region")
                    .agg(**{"Orders": ("order_id", "size"),
-                           "Late, Olist (%)": ("late_olist", "mean"), "Late, ML (%)": ("late_ours", "mean"),
-                           "Promise, Olist": ("olist_days", "mean"), "Promise, ML": ("promise", "mean")})
+                           "Late, ML (%)": ("late_ours", "mean"), "Late, Olist (%)": ("late_olist", "mean"),
+                           "Promise, ML (days)": ("promise", "mean"), "Promise, Olist (days)": ("olist_days", "mean")})
                    .reindex(REGIONS).dropna().rename_axis("Region"))
-        regions[["Late, Olist (%)", "Late, ML (%)"]] *= 100
-        st.dataframe(regions.round(2).reset_index(), hide_index=True, width="stretch",
+        regions[["Late, ML (%)", "Late, Olist (%)"]] *= 100
+        st.dataframe(regions.round(2).reset_index(), hide_index=True, width="stretch", height=35 * 6 + 3,
                      column_config={"Region": st.column_config.TextColumn(width="medium")})
 
     if T > LAST_PURCHASE:
@@ -692,9 +707,11 @@ with tab_new:
                    "try_freight": float(base.order_freight_value), "try_category": base.main_category,
                    "try_weight": None if pd.isna(base.total_weight_kg) else float(base.total_weight_kg),
                    "try_volume": None if pd.isna(base.total_volume_l) else float(base.total_volume_l)})
+    own_km = float(round(base.distance_km, 1))
     with st.container(border=True):
         where = st.columns(4)
-        new_state = where[0].selectbox("Customer state", sorted(orders.customer_state.unique()), key="try_state")
+        new_state = where[0].selectbox("Customer state", sorted(orders.customer_state.unique()), key="try_state",
+                                       on_change=fill_distance, args=(base.seller_state, base.customer_state, own_km))
         distance = where[1].number_input("Distance to the seller (km)", min_value=0.0, max_value=6000.0, step=10.0, key="try_distance")
         bought_on = where[2].date_input("Purchase date", key="try_date")
         bought_at = where[3].time_input("Purchase time", key="try_time")
@@ -706,6 +723,16 @@ with tab_new:
         size = st.columns(4)
         weight = size[0].number_input("Total weight (kg), blank if unknown", min_value=0.0, step=0.1, value=None, key="try_weight")
         volume = size[1].number_input("Total volume (litres), blank if unknown", min_value=0.0, step=0.5, value=None, key="try_volume")
+        if new_state == base.customer_state:
+            st.caption(f"Distance: this order's own, {own_km:,.1f} km from the seller's postcode to the customer's.")
+        else:
+            pair = PAIR_KM.loc[(base.seller_state, new_state)]
+            source = (f"the median of {pair.orders:,} training orders" if pair.source == "training median" else
+                      "the median of all same-state training orders (too few from this seller state)"
+                      if pair.source == "same-state training median" else
+                      f"the distance between the two states' centres ({pair.orders} training orders, too few for a median)")
+            st.caption(f"Distance filled in when the customer state changed: typical {base.seller_state} → {new_state} "
+                       f"distance, {pair.km:,.1f} km, {source}. Edit it if you know the actual distance.")
     new = {"customer_state": new_state, "distance_km": distance, "item_count": items, "order_item_value": value,
            "order_freight_value": freight, "main_category": category,
            "total_weight_kg": np.nan if weight is None else weight, "total_volume_l": np.nan if volume is None else volume}
@@ -724,8 +751,6 @@ with tab_new:
                            "The promise may be less reliable.", icon="⚠️")
         if weight is None or volume is None:
             st.info("A missing weight or volume is filled with the training median, as in the notebook.")
-        if new_state != base.customer_state and distance == round(base.distance_km, 1):
-            st.info("The customer state changed but the distance didn't. Set the distance to the new customer too.")
         purchase = pd.Timestamp.combine(bought_on, bought_at)
         if purchase.month in (11, 12):
             st.info("Peak-season order: the training months hold only one peak season, so this effect is less certain.")
@@ -744,7 +769,7 @@ with tab_new:
         parts = score(model, frame).iloc[0]
         due = purchase.normalize() + pd.Timedelta(days=int(parts.promise))
         tiles([("ML promise", f"{parts.promise:.0f} days", f"Deliver by {due:%a %d %b %Y}", ""),
-               ("Typical delivery time", f"{parts.estimate:.1f} days", "the estimate before the margin", ""),
+               ("ML estimate", f"{parts.estimate:.1f} days", "the ensemble's typical delivery time", ""),
                ("Starting order's promise", f"{base.promise:.0f} days", f"{parts.promise - base.promise:+.0f} days with your changes", "")])
         st.markdown("**How this promise was built**")
         build_steps(parts)
@@ -762,12 +787,12 @@ with tab_test:
     reliability = equal_reliability_table(orders)
     chart_side, reading_side = st.columns([3, 2])
     with chart_side:
-        st.altair_chart(reliability_chart(reliability), width="content")
+        st.altair_chart(reliability_chart(reliability), width="stretch")
     with reading_side:
         gap = reliability["Olist, scaled"].iloc[0] - reliability["ML promise"].iloc[0]
-        tiles([(f"Shorter at our tested {pct(orders.late_ours.mean())} late", f"{gap:.2f} days", RANGE_95, "")])
-        st.markdown("**Rank orders by risk, then set the cushion.** Our promise is shorter at every late rate shown.\n\n"
+        tiles([(f"Shorter at the tested {pct(orders.late_ours.mean())} late", f"{gap:.2f} days", RANGE_95, "")])
+        st.markdown("**Rank orders by risk, then set the cushion.** The ML promise is shorter at every late rate shown.\n\n"
                     "**The margin matters more than the model.** Set on slower months, it ran cautious.\n\n"
                     "**Choose the late rate deliberately.** That is a business decision.")
-    st.caption("Olist's quotes stretched by one factor until as late as ours. Only the first late rate is the margin as "
+    st.caption("Olist's quotes stretched by one factor until as late as the ML promise. Only the first late rate is the margin as "
                "tested; the other two are set on these months, to show what's achievable.")

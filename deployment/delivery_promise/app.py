@@ -28,7 +28,7 @@ DATA = HERE / "app_data" / "test_orders.parquet"
 OUTLINES = HERE / "app_data" / "brazil_states.geojson"   # built by build_map.py (click_that_hood, MIT)
 MIN_STATE = 50            # fewer delivered orders than this: the state is greyed out on the map
 GAP_MAX = 12              # the colour scale of the gap maps runs from -12 to +12 (percentage points, days)
-VERSION = "v4 (8 Nov 2026)"
+VERSION = "v6 (8 Nov 2026)"
 OURS, OLIST, GREY, INK, NAVY = "#156082", "#B5651D", "#5A6170", "#1F2430", "#0E2841"
 REGIONS = ["North", "Northeast", "Centre-West", "Southeast", "South"]
 RANGE_95 = "95% range 3.27 to 7.84"    # week-block bootstrap, Table D2 of the notebook
@@ -46,7 +46,7 @@ MAP_METRICS = {"Late rate gap": ("late_gap", "percentage points", "ML promise mi
 TOP_TITLES = {"Late rate gap": "Top states: fewer late than Olist (points)", "Promise gap": "Top states: longer than Olist (days)",
               "Late rate": "Top states: ML late rate (%)", "Orders": "Top states: delivered orders"}
 STYLE = """<style>
-.block-container {padding-top: 3.2rem; padding-bottom: 2rem; max-width: 1560px}
+.block-container {padding-top: 3.2rem; padding-bottom: 2rem; max-width: none}
 .app-bar {background: #0E2841; color: #fff; border-radius: 10px; padding: 12px 20px; display: flex;
           justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap}
 .app-bar .name {font-size: 1.3rem; font-weight: 700}
@@ -63,6 +63,17 @@ STYLE = """<style>
 h3 {font-size: 1.2rem !important; padding-top: .4rem !important}
 [data-stale="true"], .stale-element {opacity: 1 !important; transition: none !important}
 [data-testid="stStatusWidget"] {visibility: hidden}
+.chart-title {font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis}
+/* bordered map and chart panels: white cards like the tiles, with tighter padding so legends fit on laptops */
+[class*="st-key-chart_"], .st-key-map_panel {background: #fff; padding: 12px !important}
+.st-key-map_panel [data-testid="stButtonGroup"] button {padding: 2px 9px; min-height: 2rem}
+.st-key-map_panel [data-testid="stButtonGroup"] button p {font-size: .85rem}
+/* the three action cards: every card as tall as the tallest */
+.st-key-actions [data-testid="stHorizontalBlock"] {align-items: stretch}
+.st-key-actions [data-testid="stColumn"] > div,
+.st-key-actions [data-testid="stElementContainer"],
+.st-key-actions [data-testid="stAlert"],
+.st-key-actions [data-testid="stAlertContainer"] {height: 100%}
 </style>"""
 
 # The theme file can't sit at the team repository's root (it would restyle the team's other app), so set it here.
@@ -72,7 +83,7 @@ if any(st_config.get_option(key) != value for key, value in THEME.items()):
         st_config.set_option(key, value)
     st.rerun()
 
-st.set_page_config(page_title="Olist delivery promise", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Olist delivery promise", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
 st.markdown(STYLE, unsafe_allow_html=True)
 
 
@@ -140,32 +151,72 @@ def lines(wide, upto, y_title, y_max, x_range, series=("ML promise", "Olist's qu
     """Lines up to the day before the clock, on fixed axes so the chart fills in."""
     data = (wide[wide.index < upto].rename_axis("Day").reset_index()
             .melt("Day", var_name="Series", value_name="Value"))
-    legend = alt.Legend(orient="top", title=None, symbolStrokeWidth=2, labelFontSize=11, symbolSize=120, columnPadding=8)
-    return alt.Chart(data).mark_line(strokeWidth=2).encode(
-        x=alt.X("Day:T", title=None, scale=alt.Scale(domain=x_range), axis=alt.Axis(format="%d %b", grid=False)),
-        y=alt.Y("Value:Q", title=y_title, scale=alt.Scale(domain=[0, y_max])),
+    legend = alt.Legend(orient="top", title=None, symbolStrokeWidth=2, labelFontSize=10, symbolSize=60, columnPadding=3, labelOffset=2)
+    chart = alt.Chart(data).mark_line(strokeWidth=2).encode(
+        x=alt.X("Day:T", title=None, scale=alt.Scale(domain=x_range), axis=MONTHS),
+        y=alt.Y("Value:Q", title=y_title, scale=alt.Scale(domain=[0, y_max]), axis=y_axis()),
         color=alt.Color("Series:N", scale=alt.Scale(domain=list(series), range=list(colours)), legend=legend),
         strokeDash=alt.StrokeDash("Series:N", legend=legend, scale=alt.Scale(
             domain=list(series), range=[[6, 4] if s in dashed else [1, 0] for s in series])),
-        tooltip=[alt.Tooltip("Day:T", format="%a %d %b %Y"), "Series:N", alt.Tooltip("Value:Q", format=".2f")],
-    ).properties(height=190)
+        tooltip=[alt.Tooltip("Day:T", format="%a %d %b %Y"), "Series:N", alt.Tooltip("Value:Q", format=".2f")])
+    return no_new_orders(chart, x_range).properties(height=CHART_H, background="#FFFFFF")
 
 
-def reference_line(value, label, domain):
-    """A dashed horizontal line with a label, e.g. the margin in use."""
+def reference_line(value, label, domain, title):
+    """A dashed horizontal line with a label, e.g. the margin in use; it also carries the chart's y-axis."""
     base = alt.Chart(pd.DataFrame({"y": [value]}))
-    y = alt.Y("y:Q", title=None, scale=alt.Scale(domain=domain))
+    y = alt.Y("y:Q", title=title, scale=alt.Scale(domain=domain), axis=y_axis())
     return (base.mark_rule(strokeDash=[4, 4], color=GREY).encode(y=y)
             + base.mark_text(align="left", dx=4, dy=-6, color=GREY).encode(x=alt.value(0), y=y, text=alt.value(label)))
 
 
+def empty_note(chart, data, domain):
+    """Before the first weekly check, write a note in the middle of the empty plot."""
+    if len(data):
+        return chart
+    note = alt.Chart(pd.DataFrame({"y": [sum(domain) / 2]})).mark_text(color=GREY, fontSize=12).encode(
+        x=alt.value(150), y=alt.Y("y:Q", scale=alt.Scale(domain=domain), axis=y_axis()),
+        text=alt.value("First check about 7 June"))
+    return chart + note
+
+
+def chart_title(text):
+    """One line per chart title, so the charts in a row always start level (a long title ends in '…', hover for all)."""
+    st.markdown(f'<div class="chart-title" title="{text}">{text}</div>', unsafe_allow_html=True)
+
+
+def no_new_orders(chart, x_range, at="top"):
+    """Grey out the days after the last test purchase: from here on, only the slower parcels are still arriving.
+    The note sits in the band's right-hand corner, clear of the lines (at the bottom where a line runs along the top)."""
+    band = pd.DataFrame({"start": [LAST_PURCHASE], "end": [x_range[1]],
+                         "note": [f"No new orders\nafter {LAST_PURCHASE:%d %b}"]})
+    scale = alt.Scale(domain=x_range)
+    shade = alt.Chart(band).mark_rect(color="#8A93A3", opacity=0.14).encode(
+        x=alt.X("start:T", scale=scale, title=None), x2="end:T")
+    label = alt.Chart(band).mark_text(align="right", baseline="top" if at == "top" else "bottom",
+                                      dx=-4, dy=0 if at == "top" else -4,
+                                      lineBreak="\n", fontSize=10, color=GREY).encode(
+        x=alt.X("end:T", scale=scale, title=None),
+        y=alt.value(4) if at == "top" else alt.datum(0), text="note:N")
+    return alt.layer(shade, label, chart)
+
+
+MONTHS = alt.Axis(format="%d %b", grid=False, tickCount={"interval": "month", "step": 1})
+
+
 def week_x(x_range):
-    return alt.X("Week ending:T", title=None, scale=alt.Scale(domain=x_range), axis=alt.Axis(format="%d %b", grid=False))
+    return alt.X("Week ending:T", title=None, scale=alt.Scale(domain=x_range), axis=MONTHS)
 
 
+CHART_H = 237                    # plot height of the four monitoring charts, so the grid ends level with the map panel
 WEEK_TIP = alt.Tooltip("Week ending:T", format="%a %d %b %Y")
 READINGS = ["Margin about right", "Points shorter", "Points longer"]
 MARGIN_AXIS = [0.8, 2.6]
+
+
+def y_axis():
+    """The same y-axis width on every monitoring chart, so their plots line up."""
+    return alt.Axis(minExtent=48, maxExtent=48)
 
 
 def margin_chart(weeks, current, x_range):
@@ -173,23 +224,27 @@ def margin_chart(weeks, current, x_range):
     data = weeks.dropna(subset=["Suggested margin"])
     x = week_x(x_range)
     line = alt.Chart(data).mark_line(strokeWidth=2, color=GREY).encode(
-        x=x, y=alt.Y("Suggested margin:Q", title="Margin (×)", scale=alt.Scale(domain=MARGIN_AXIS)))
+        x=x, y=alt.Y("Suggested margin:Q", title="Margin (×)", scale=alt.Scale(domain=MARGIN_AXIS), axis=y_axis()))
     points = alt.Chart(data).mark_point(filled=True, size=60).encode(
         x=x, y="Suggested margin:Q",
-        color=alt.Color("Advice:N", legend=alt.Legend(orient="top", title=None, labelFontSize=11, columnPadding=8),
+        color=alt.Color("Advice:N", legend=alt.Legend(orient="top", title=None, labelFontSize=10, symbolSize=50, columnPadding=4, labelOffset=3),
                         scale=alt.Scale(domain=READINGS, range=["#2E7D32", "#C77C02", "#C62828"])),
         shape=alt.Shape("Advice:N", legend=None, scale=alt.Scale(domain=READINGS, range=["circle", "triangle-down", "triangle-up"])),
         tooltip=[WEEK_TIP, alt.Tooltip("Suggested margin:Q", format=".2f"), "Advice:N"])
-    return (reference_line(current, f"In use × {current:.3f}", MARGIN_AXIS) + line + points).properties(height=190)
+    chart = reference_line(current, f"In use × {current:.3f}", MARGIN_AXIS, "Margin (×)") + line + points
+    return no_new_orders(empty_note(chart, data, MARGIN_AXIS), x_range).properties(height=CHART_H, background="#FFFFFF")
 
 
 def error_chart(weeks, x_range):
     """The estimate's error at each week's check, against the retrain line."""
-    data = weeks.dropna(subset=["MAE"])
-    line = alt.Chart(data).mark_line(point=True, strokeWidth=2, color=OURS).encode(
-        x=week_x(x_range), y=alt.Y("MAE:Q", title="Days", scale=alt.Scale(domain=[0, 7])),
+    data = weeks.dropna(subset=["MAE"]).assign(Series="Estimate error (MAE)")
+    line = alt.Chart(data).mark_line(point=True, strokeWidth=2).encode(
+        x=week_x(x_range), y=alt.Y("MAE:Q", title="Days", scale=alt.Scale(domain=[0, 7]), axis=y_axis()),
+        color=alt.Color("Series:N", scale=alt.Scale(domain=["Estimate error (MAE)"], range=[OURS]), legend=alt.Legend(
+            orient="top", title=None, labelFontSize=10, symbolType="stroke", symbolStrokeWidth=2, symbolSize=80)),
         tooltip=[WEEK_TIP, alt.Tooltip("MAE:Q", format=".2f")])
-    return (reference_line(monitor.RETRAIN_MAE, f"Retrain above {monitor.RETRAIN_MAE:.2f}", [0, 7]) + line).properties(height=190)
+    chart = reference_line(monitor.RETRAIN_MAE, f"Retrain above {monitor.RETRAIN_MAE:.2f}", [0, 7], "Days") + line
+    return no_new_orders(empty_note(chart, data, [0, 7]), x_range, at="bottom").properties(height=CHART_H, background="#FFFFFF")
 
 
 def state_stats(delivered):
@@ -310,7 +365,7 @@ def build_steps(parts):
 
 
 def order_label(row):
-    return f"{row.order_id[:10]}…  ·  bought {row.purchased:%d %b %Y}  ·  {row.customer_state} ← {row.seller_state}"
+    return f"{row.order_id[:10]}…  ·  bought {row.purchased:%d %b %Y}  ·  {row.seller_state} → {row.customer_state}"
 
 
 def pick_random():
@@ -352,14 +407,14 @@ with st.sidebar:
         "4. **Try a new order:** start from a past order, change its details, and get a new promise.")
     st.header("About the model")
     st.markdown(
-        "Equal-weight average of log-linear regression (Log OLS) and a random forest, plus a × 1.893 safety "
+        "Ensemble of log-linear regression (Log OLS) and a random forest, plus a × 1.893 safety "
         "margin, rounded up to whole days. The margin makes the ML promise late no more often than Olist's "
         "quotes on validation (9.51% of orders).\n\n"
         "Trained on 70,851 delivered orders bought January 2017 to April 2018. Tested once on 25,352 "
         "orders bought May to August 2018.")
     if check_ok:
         st.success(f"Model loaded; start-up check passed: all {len(orders):,} test promises reproduced.")
-    st.caption(f"App version {VERSION}. State outlines: Code for America's click_that_hood (MIT licence), simplified.")
+    st.caption(f"{VERSION.split()[0]} · State outlines: click_that_hood (Code for America, MIT licence)")
 
 st.markdown('<div class="app-bar"><span class="name">Olist Delivery Promise | Model Operations</span>'
             '<span class="note">Test period: May to August 2018</span></div>', unsafe_allow_html=True)
@@ -374,7 +429,7 @@ tab_live, tab_test, tab_past, tab_new = st.tabs(["Operations command centre", "T
 # Tab 1: Operations command centre
 # ----------------------------------------------------------------------------------------------
 START = orders.purchased.min().normalize()
-CLOCK_START = pd.Timestamp("2018-05-15")   # the clock starts here: before mid-May, few orders have arrived yet
+CLOCK_START = START                        # the clock starts before the first order, so every count starts at 0
 END = orders.delivered.max().ceil("h")
 LAST_PURCHASE = orders.purchased.max()
 CURRENT = float(np.exp(model.log_margin))
@@ -413,7 +468,7 @@ def jump_to_date():
 def model_status(check, streak):
     """The one-glance verdict: label, note and tone."""
     if not check["ready"]:
-        return "Warming up", "First margin check about 7 June", ""
+        return "Burn-in", "First margin check about 7 June", ""
     if check["retrain"]:
         return "Retrain", f"Error above {monitor.RETRAIN_MAE:.2f} days", "bad"
     if check["refresh"] and streak >= monitor.REVIEW_WEEKS:
@@ -423,7 +478,7 @@ def model_status(check, streak):
 
 def action_cards(week, check, streak):
     """What to do now, in the deck's order: late deliveries, the margin, the model."""
-    a = st.columns(3)
+    a = st.container(key="actions").columns(3)
     with a[0]:
         if not week["ready"]:
             st.info(f"**Late deliveries:** too few in the last 7 days to judge ({week['n']:,}).")
@@ -467,7 +522,7 @@ def command_centre():
 
     controls = st.columns([1, 1, 1, 2.2, 2, 2.6], vertical_alignment="bottom")
     controls[0].button("Pause" if ss.playing else "Play", on_click=toggle_play, type="primary", width="stretch")
-    controls[1].button("Restart", on_click=restart, width="stretch")
+    controls[1].button("Reset", on_click=restart, width="stretch")
     controls[2].button("Jump to end", on_click=jump_to_end, width="stretch")
     controls[3].select_slider("Speed (days per second)", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], value=1.0, key="speed")
     controls[4].date_input("Jump to a date", value=None, min_value=START.date(), max_value=END.date(), key="jump", on_change=jump_to_date)
@@ -475,9 +530,8 @@ def command_centre():
 
     placed = orders.iloc[: orders.purchased.searchsorted(T, side="right")]
     delivered = by_delivery.iloc[: by_delivery.delivered.searchsorted(T, side="right")]
-    if delivered.empty:
-        st.info("No order delivered yet. Press Play, or jump to a date.")
-        return
+    if placed.empty:
+        st.info("No orders yet. Press Play to start the test months, or jump to a date.")
 
     week = monitor.late_now(by_delivery, T)
     check = monitor.margin_check(orders, T, model.log_margin)
@@ -487,17 +541,21 @@ def command_centre():
     status, status_note, tone = model_status(check, streak)
     margin_note = f"Suggested × {check['margin']:.2f}" if check["ready"] else "No suggestion yet"
 
+    none_yet = "No orders yet" if placed.empty else "No deliveries yet"      # a rate or an average of nothing is not 0
     tiles([("Model status", status, status_note, tone),
-           ("Late deliveries", pct(delivered.late_ours.mean()), f"Olist's quotes {pct(delivered.late_olist.mean())}", ""),
-           ("Average promise", f"{placed.promise.mean():.2f} days", f"Olist's quotes {placed.olist_days.mean():.2f}", ""),
-           ("Estimate error", f"{delivered.error.abs().mean():.2f} days", f"Retrain above {monitor.RETRAIN_MAE:.2f}", ""),
+           ("Late deliveries", pct(delivered.late_ours.mean()) if len(delivered) else "–",
+            f"Olist's quotes {pct(delivered.late_olist.mean())}" if len(delivered) else none_yet, ""),
+           ("Average promise", f"{placed.promise.mean():.2f} days" if len(placed) else "–",
+            f"Olist's quotes {placed.olist_days.mean():.2f}" if len(placed) else "No orders yet", ""),
+           ("Estimate error", f"{delivered.error.abs().mean():.2f} days" if len(delivered) else "–",
+            f"Retrain above {monitor.RETRAIN_MAE:.2f}", ""),
            ("Margin in use", f"× {CURRENT:.3f}", margin_note, ""),
            ("Delivered", f"{len(delivered):,}", f"{len(placed) - len(delivered):,} in flight", "")])
     action_cards(week, check, streak)
 
     x_range = [START, END.normalize()]
-    left, right = st.columns([5, 7])
-    with left:
+    left, right = st.columns([4, 8])
+    with left, st.container(border=True, key="map_panel"):
         chosen = st.segmented_control("Map shows", list(MAP_METRICS), default="Late rate gap", key="map_metric",
                                       label_visibility="collapsed") or "Late rate gap"
         field, unit, reading = MAP_METRICS[chosen]
@@ -508,23 +566,17 @@ def command_centre():
     with right:
         top = st.columns(2)
         bottom = st.columns(2)
-        with top[0]:
-            st.markdown("**Late rate, last 7 days of deliveries**")
+        with top[0], st.container(border=True, key="chart_1"):
+            chart_title("Late rate, last 7 days of deliveries")
             st.altair_chart(lines(late_daily, T.normalize(), "% late", LATE_MAX, x_range), width="stretch")
-        with top[1]:
-            st.markdown("**Suggested margin against the margin in use**")
-            if weeks["Suggested margin"].notna().any():
-                st.altair_chart(margin_chart(weeks, CURRENT, x_range), width="stretch")
-            else:
-                st.caption("First check about 7 June.")
-        with bottom[0]:
-            st.markdown("**Estimate error against the retrain line**")
-            if weeks["MAE"].notna().any():
-                st.altair_chart(error_chart(weeks, x_range), width="stretch")
-            else:
-                st.caption("First check about 7 June.")
-        with bottom[1]:
-            st.markdown("**Promises, estimate and actual delivery (median days)**")
+        with top[1], st.container(border=True, key="chart_2"):
+            chart_title("Suggested margin against the margin in use")
+            st.altair_chart(margin_chart(weeks, CURRENT, x_range), width="stretch")
+        with bottom[0], st.container(border=True, key="chart_3"):
+            chart_title("Estimate error against the retrain line")
+            st.altair_chart(error_chart(weeks, x_range), width="stretch")
+        with bottom[1], st.container(border=True, key="chart_4"):
+            chart_title("Promises, estimate and actual (median days)")
             st.altair_chart(lines(days_daily, T.normalize(), "Days", DAYS_MAX, x_range,
                                   series=("Olist's quotes", "ML promise", "ML estimate", "Actual"),
                                   colours=(OLIST, OURS, OURS, GREY), dashed=("ML estimate",)), width="stretch")
@@ -559,7 +611,7 @@ def command_centre():
         st.dataframe(pd.DataFrame({
             "Time": feed.when.dt.strftime("%d %b %H:%M"),
             "Event": feed.event,
-            "Route (customer ← seller)": feed.customer_state + " ← " + feed.seller_state,
+            "Route (seller → customer)": feed.seller_state + " → " + feed.customer_state,
             "ML promise (days)": feed.promise.astype(int),
             "Olist's quote (days)": feed.olist_days,
             "Actual (days)": np.where(is_done, feed.delivery_days.astype(int).astype(str), "–"),
@@ -574,10 +626,12 @@ def command_centre():
                            "Promise, Olist": ("olist_days", "mean"), "Promise, ML": ("promise", "mean")})
                    .reindex(REGIONS).dropna().rename_axis("Region"))
         regions[["Late, Olist (%)", "Late, ML (%)"]] *= 100
-        st.dataframe(regions.round(2), width="stretch")
+        st.dataframe(regions.round(2).reset_index(), hide_index=True, width="stretch",
+                     column_config={"Region": st.column_config.TextColumn(width="medium")})
 
     if T > LAST_PURCHASE:
-        st.caption("No new orders after 31 August 2018, the end of the test months; the remaining parcels are still arriving.")
+        st.caption(f"No new orders after {LAST_PURCHASE:%d %B %Y}, the last test purchase; the remaining parcels, "
+                   "mostly the slow ones, are still arriving.")
     st.caption(f"The {len(orders):,} test orders on a simulated clock. Each order is scored by the deployed model when it is bought "
                "and judged only when it is delivered. At the end, the totals equal the tested results. Fewer orders bought in "
                "late August appear in the data, so the last weeks thin out.")
@@ -696,8 +750,8 @@ with tab_new:
 
 with tab_test:
     st.subheader("Ensemble model for the delivery promise: results")
-    st.caption(f"Test period: May to August 2018, {len(orders):,} orders, scored once. Equal-weight average of log-linear "
-               f"regression and a random forest, plus a × {CURRENT:.3f} safety margin.")
+    st.caption(f"Test period: May to August 2018, {len(orders):,} orders, scored once. Ensemble of log-linear "
+               f"regression (Log OLS) and a random forest, plus a × {CURRENT:.3f} safety margin.")
     tiles([("Late deliveries", pct(orders.late_ours.mean()), f"Olist's quotes {pct(orders.late_olist.mean())}", ""),
            ("Average promise", f"{orders.promise.mean():.2f} days", f"Olist's quotes {orders.olist_days.mean():.2f}", ""),
            ("Estimate error", f"{orders.error.abs().mean():.2f} days", "Log OLS 4.35, forest 5.27", "")])
